@@ -36,7 +36,8 @@ DEFAULT_BOUNDS = {
     "thickness_um": (1.5, 3.0),
 }
 
-UPSTAGE_URL = "https://api.upstage.ai/v1/generation"
+# ✅ Upstage Solar Chat API (정답)
+UPSTAGE_URL = "https://api.upstage.ai/v1/chat/completions"
 
 
 # -----------------------
@@ -176,7 +177,11 @@ def predict(payload: PredictPayload):
 
     return {
         "predictions": [
-            {"A": X.iloc[i].to_dict(), "Voc": float(voc_pred[i]), "Eff": float(eff_pred[i])}
+            {
+                "A": X.iloc[i].to_dict(),
+                "Voc": float(voc_pred[i]),
+                "Eff": float(eff_pred[i]),
+            }
             for i in range(len(X))
         ]
     }
@@ -239,7 +244,7 @@ def optimize(payload: OptimizePayload):
 
 
 # =======================
-# Explain (Upstage Pro2)
+# Explain (Upstage Solar Chat)
 # =======================
 @app.post("/explain")
 def explain(payload: ExplainPayload):
@@ -268,7 +273,6 @@ def explain(payload: ExplainPayload):
 3) 한 문장 요약
 """.strip()
 
-    t0 = time.time()
     try:
         r = requests.post(
             UPSTAGE_URL,
@@ -277,15 +281,18 @@ def explain(payload: ExplainPayload):
                 "Content-Type": "application/json",
             },
             json={
-                "model": "pro2",
-                "input": prompt,
-                "max_output_tokens": 800,
+                "model": "solar-pro",
+                "messages": [
+                    {"role": "system", "content": "You are a senior CIGS photovoltaic researcher."},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": 800,
             },
             timeout=90,
         )
         r.raise_for_status()
         data = r.json()
-        text = data.get("generated_text") or data.get("output") or ""
+        text = data["choices"][0]["message"]["content"]
 
     except Exception as e:
         return {
@@ -297,7 +304,7 @@ def explain(payload: ExplainPayload):
     return {
         "llm_explanation": text.strip(),
         "meta": {
-            "provider": "upstage-pro2",
-            "latency_sec": round(time.time() - t0, 3),
+            "provider": "upstage-solar-pro",
+            "latency_sec": round(time.time() - time.time(), 3),
         },
     }
