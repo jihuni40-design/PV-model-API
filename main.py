@@ -72,48 +72,9 @@ def _safe_json(x: Any, max_len: int = 4000) -> str:
     return s
 
 
-def _extract_output_text(resp: Any) -> str:
-    """
-    Robust extractor for OpenAI Responses API:
-    resp.output[*].content[*] where content.type == "output_text"
-    Works for SDK object and dict-like shapes.
-    """
-    # 1) output_text shortcut (if present)
-    t = getattr(resp, "output_text", None)
-    if isinstance(t, str) and t.strip():
-        return t.strip()
-    if isinstance(resp, dict):
-        t = resp.get("output_text")
-        if isinstance(t, str) and t.strip():
-            return t.strip()
-
-    # 2) iterate output blocks
-    output = getattr(resp, "output", None)
-    if output is None and isinstance(resp, dict):
-        output = resp.get("output")
-
-    if not output:
-        return ""
-
-    out_text = ""
-    for item in output:
-        content = getattr(item, "content", None)
-        if content is None and isinstance(item, dict):
-            content = item.get("content", [])
-        if not content:
-            continue
-
-        for c in content:
-            c_type = getattr(c, "type", None)
-            c_text = getattr(c, "text", None)
-            if isinstance(c, dict):
-                c_type = c.get("type", c_type)
-                c_text = c.get("text", c_text)
-
-            if c_type == "output_text" and isinstance(c_text, str):
-                out_text += c_text
-
-    return out_text.strip()
+def _safe_numeric_series(s: pd.Series) -> pd.Series:
+    """Convert to numeric and drop NaNs safely."""
+    return pd.to_numeric(s, errors="coerce").dropna()
 
 
 # -----------------------
@@ -145,7 +106,7 @@ class PredictPayload(BaseModel):
 
 class OptimizePayload(BaseModel):
     n_calls: int = 25
-    top_k: int = 10
+    top_k: int = 10  # (현재는 1개만 반환. 확장하려면 별도 구현 필요)
     w_voc: float = 0.5
     w_eff: float = 0.5
     bounds: Optional[Dict[str, List[float]]] = None
@@ -173,31 +134,52 @@ def health():
 # -----------------------
 @app.post("/train")
 def train(payload: TrainPayload):
+    if not payload.rows:
+        raise HTTPException(status_code=400, detail="No training rows provided.")
+
     df = pd.DataFrame([r.model_dump() for r in payload.rows])
 
     for col in FEATURES + TARGETS:
         if col not in df.columns:
             raise HTTPException(status_code=400, detail=f"Missing column: {col}")
 
-    X = df[FEATURES]
-    y_voc = df["Voc"]
-    y_eff = df["Eff"]
+    X = df[FEATURES].copy()
+    y_voc = _safe_numeric_series(df["Voc"])
+    y_eff = _safe_numeric_series(df["Eff"])
+
+    # X와 y 길이 일치시키기 위해 NaN 행 제거(보수적으로 처리)
+    df2 = df.copy()
+    df2["Voc"] = pd.to_numeric(df2["Voc"], errors="coerce")
+    df2["Eff"] = pd.to_numeric(df2["Eff"], errors="coerce")
+    df2 = df2.dropna(subset=FEATURES + TARGETS)
+
+    if df2.empty:
+        raise HTTPException(status_code=400, detail="Invalid training data after cleaning.")
+
+    X2 = df2[FEATURES]
+    y_voc2 = df2["Voc"]
+    y_eff2 = df2["Eff"]
 
     voc_model = RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42)
     eff_model = RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42)
 
-    voc_model.fit(X, y_voc)
-    eff_model.fit(X, y_eff)
+    voc_model.fit(X2, y_voc2)
+    eff_model.fit(X2, y_eff2)
 
     joblib.dump(voc_model, VOC_MODEL)
     joblib.dump(eff_model, EFF_MODEL)
 
     state = load_state()
-    state["Voc_max"] = max(float(state.get("Voc_max", 0.0)), float(df["Voc"].max()))
-    state["Eff_max"] = max(float(state.get("Eff_max", 0.0)), float(df["Eff"].max()))
+    voc_max_new = float(pd.to_numeric(df2["Voc"], errors="coerce").max())
+    eff_max_new = float(pd.to_numeric(df2["Eff"], errors="coerce").max())
+    if not pd.isna(voc_max_new):
+        state["Voc_max"] = max(float(state.get("Voc_max", 0.0)), voc_max_new)
+    if not pd.isna(eff_max_new):
+        state["Eff_max"] = max(float(state.get("Eff_max", 0.0)), eff_max_new)
+
     save_state(state)
 
-    return {"status": "trained", "rows_used": len(df), "state": state}
+    return {"status": "trained", "rows_used": int(len(df2)), "state": state}
 
 
 # -----------------------
@@ -206,6 +188,9 @@ def train(payload: TrainPayload):
 @app.post("/predict")
 def predict(payload: PredictPayload):
     ensure_models_exist()
+
+    if not payload.rows:
+        raise HTTPException(status_code=400, detail="No prediction rows provided.")
 
     X = pd.DataFrame([r.model_dump() for r in payload.rows])[FEATURES]
     voc_model = joblib.load(VOC_MODEL)
@@ -409,15 +394,17 @@ def explain(payload: ExplainPayload):
         r.raise_for_status()
         data = r.json()
 
+        # Upstage 응답 포맷 방어적으로 처리
         text = ""
-        if "generated_text" in data:
-            text = data["generated_text"]
-        elif "output" in data:
-            text = data["output"]
-        elif "outputs" in data and isinstance(data["outputs"], list):
-            text = data["outputs"][0].get("text", "")
-        elif "result" in data:
-            text = data["result"].get("text", "")
+        if isinstance(data, dict):
+            if "generated_text" in data:
+                text = data["generated_text"]
+            elif "output" in data:
+                text = data["output"]
+            elif "outputs" in data and isinstance(data["outputs"], list) and data["outputs"]:
+                text = (data["outputs"][0].get("text") or "")
+            elif "result" in data and isinstance(data["result"], dict):
+                text = (data["result"].get("text") or "")
 
     except Exception as e:
         return {
@@ -427,7 +414,7 @@ def explain(payload: ExplainPayload):
         }
 
     return {
-        "llm_explanation": text.strip() or "(Upstage 출력 없음)",
+        "llm_explanation": (text.strip() or "(Upstage 출력 없음)"),
         "meta": {
             "provider": "upstage-pro2",
             "latency_sec": round(time.time() - t0, 3),
