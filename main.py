@@ -283,7 +283,10 @@ def optimize(payload: OptimizePayload):
 def explain(payload: ExplainPayload):
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=400, detail="OPENAI_API_KEY not set on server.")
+        raise HTTPException(
+            status_code=400,
+            detail="OPENAI_API_KEY not set on server."
+        )
 
     client = OpenAI(api_key=api_key)
 
@@ -291,16 +294,16 @@ def explain(payload: ExplainPayload):
 너는 태양전지(특히 CIGS) 연구실의 선임 연구자다.
 
 [BO 제안 A]
-{json.dumps(payload.suggested_A, ensure_ascii=False)}
+{json.dumps(payload.suggested_A or {}, ensure_ascii=False)}
 
 [예측 결과]
-{json.dumps(payload.pred_at_suggested, ensure_ascii=False)}
+{json.dumps(payload.pred_at_suggested or {}, ensure_ascii=False)}
 
 [best_set]
-{json.dumps(payload.best_set, ensure_ascii=False)}
+{json.dumps(payload.best_set or {}, ensure_ascii=False)}
 
 [objective]
-{json.dumps(payload.objective, ensure_ascii=False)}
+{json.dumps(payload.objective or {}, ensure_ascii=False)}
 
 연구노트 톤으로:
 1) 왜 이 조합이 Voc/Eff 관점에서 유망한지
@@ -316,11 +319,23 @@ def explain(payload: ExplainPayload):
     )
 
     text = ""
-    if resp.output:
-        for item in resp.output:
-            for c in item.get("content", []):
-                if c.get("type") == "output_text":
-                    text += c.get("text", "")
 
-    return {"llm_explanation": text.strip()}
-```
+    # ✅ SDK 객체 / dict 모두 대응
+    try:
+        if hasattr(resp, "output") and resp.output:
+            for item in resp.output:
+                content = getattr(item, "content", None) or item.get("content", [])
+                for c in content:
+                    c_type = getattr(c, "type", None) or c.get("type")
+                    if c_type == "output_text":
+                        text += getattr(c, "text", None) or c.get("text", "")
+    except Exception as e:
+        # 절대 500으로 안 터지게 방어
+        text = f"(LLM 응답 파싱 중 경고: {str(e)})"
+
+    if not text.strip():
+        text = "(LLM 출력이 비어 있습니다. 프롬프트 또는 모델 상태를 확인하세요.)"
+
+    return {
+        "llm_explanation": text.strip()
+    }
