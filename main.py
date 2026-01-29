@@ -128,7 +128,20 @@ def health():
 @app.post("/train")
 def train(payload: TrainPayload):
     df = pd.DataFrame([r.model_dump() for r in payload.rows])
+for col in FEATURES + TARGETS:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
 
+# inf / -inf 제거
+df = df.replace([float("inf"), float("-inf")], None)
+
+# NaN 포함 row 제거
+df = df.dropna(subset=FEATURES + TARGETS)
+
+if len(df) < 5:
+    raise HTTPException(
+        status_code=400,
+        detail=f"Not enough valid rows after cleaning. rows={len(df)}"
+    )
     X = df[FEATURES]
     y_voc = df["Voc"]
     y_eff = df["Eff"]
