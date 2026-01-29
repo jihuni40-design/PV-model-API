@@ -1,8 +1,8 @@
 fastapi
 uvicorn
+pydantic
 pandas
-numpy
 scikit-learn
-joblib
 scikit-optimize
-openai
+joblib
+requests
