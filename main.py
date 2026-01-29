@@ -268,9 +268,9 @@ def explain(payload: ExplainPayload):
 {_safe_json(payload.objective)}
 
 다음을 한국어로 작성:
-1) 왜 이 조합이 최적인지
-2) 다음 실험 추천
-3) 한 문장 요약
+1) 추출된 효율 + Voc 조합이 왜 최적인지 설명
+2) 다음 실험 조건 추천
+3) 위 내용을 한 문장으로 요약
 """.strip()
 
     try:
