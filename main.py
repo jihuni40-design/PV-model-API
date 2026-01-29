@@ -277,7 +277,7 @@ def optimize(payload: OptimizePayload):
     }
 
 # -----------------------
-# Explain (LLM, GPT-5.2)
+# Explain (LLM, GPT-4.1)
 # -----------------------
 @app.post("/explain")
 def explain(payload: ExplainPayload):
@@ -310,7 +310,7 @@ def explain(payload: ExplainPayload):
 """
 
     resp = client.responses.create(
-        model="gpt-5.2",
+        model="gpt-4.1",
         input=prompt,
         temperature=0.4
     )
