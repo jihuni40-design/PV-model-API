@@ -128,20 +128,7 @@ def health():
 @app.post("/train")
 def train(payload: TrainPayload):
     df = pd.DataFrame([r.model_dump() for r in payload.rows])
-for col in FEATURES + TARGETS:
-    df[col] = pd.to_numeric(df[col], errors="coerce")
 
-# inf / -inf 제거
-df = df.replace([float("inf"), float("-inf")], None)
-
-# NaN 포함 row 제거
-df = df.dropna(subset=FEATURES + TARGETS)
-
-if len(df) < 5:
-    raise HTTPException(
-        status_code=400,
-        detail=f"Not enough valid rows after cleaning. rows={len(df)}"
-    )
     X = df[FEATURES]
     y_voc = df["Voc"]
     y_eff = df["Eff"]
@@ -253,7 +240,6 @@ def optimize(payload: OptimizePayload):
         },
     }
 
-
 # =======================
 # Explain (Upstage Pro2)
 # =======================
@@ -281,7 +267,7 @@ def explain(payload: ExplainPayload):
 [objective]
 {safe_json(payload.objective)}
 
-다음을 전문 태양전지 연구자의 연구노트 톤으로 작성:
+다음을 태양전지 전문 연구자의 관점에서 연구노트 톤으로 작성:
 1) 추출된 효율, Voc 데이터가 왜 최적의 조합인지 설명
 2) 다음 실험에 쓸 최적의 조합 추천
 3) 위 내용 한 문장 요약
