@@ -1,8 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import pandas as pd
-import numpy as np
 import joblib
 import os
 import json
@@ -40,7 +39,6 @@ def load_state() -> Dict[str, float]:
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    # 초기값은 너무 작으면 score 폭주하니까 "현실적인 디폴트"로 둠
     return {"Voc_max": 0.75, "Eff_max": 18.0}
 
 def save_state(state: Dict[str, float]) -> None:
@@ -55,12 +53,10 @@ def ensure_models_exist():
 # Schemas
 # -----------------------
 class TrainRow(BaseModel):
-    # A
     cu_ratio: float
     ga_ratio: float
     metal_se: float
     thickness_um: float
-    # B
     Voc: float
     Eff: float
 
@@ -77,18 +73,14 @@ class PredictPayload(BaseModel):
     rows: List[PredictRow]
 
 class OptimizePayload(BaseModel):
-    # BO 설정
     n_calls: int = 25
-    top_k: int = 10  # 결과로 top 후보 몇 개 뽑을지(간단히 best_set만 써도 OK)
+    top_k: int = 10
     w_voc: float = 0.5
     w_eff: float = 0.5
-    # bounds override (선택)
     bounds: Optional[Dict[str, List[float]]] = None
-    # BO seed (선택): 특정 시작점 제공 가능
     seed_A: Optional[List[Dict[str, float]]] = None
 
 class ExplainPayload(BaseModel):
-    # /optimize 응답 그대로 넣어도 되게 유연하게
     suggested_A: Optional[Dict[str, float]] = None
     pred_at_suggested: Optional[Dict[str, float]] = None
     best_set: Optional[Dict[str, Any]] = None
@@ -109,7 +101,6 @@ def health():
 def train(payload: TrainPayload):
     df = pd.DataFrame([r.model_dump() for r in payload.rows])
 
-    # 유효성
     for col in FEATURES + TARGETS:
         if col not in df.columns:
             raise HTTPException(status_code=400, detail=f"Missing column: {col}")
@@ -127,7 +118,6 @@ def train(payload: TrainPayload):
     joblib.dump(voc_model, VOC_MODEL)
     joblib.dump(eff_model, EFF_MODEL)
 
-    # state 갱신: 실험 데이터 기반으로만 갱신 (안전)
     state = load_state()
     state["Voc_max"] = max(state["Voc_max"], float(df["Voc"].max()))
     state["Eff_max"] = max(state["Eff_max"], float(df["Eff"].max()))
@@ -149,7 +139,6 @@ def predict(payload: PredictPayload):
     voc_pred = voc_model.predict(X)
     eff_pred = eff_model.predict(X)
 
-    # 입력 A도 같이 반환하면 n8n에서 후처리 편해짐
     preds = []
     for i in range(len(X)):
         preds.append({
@@ -161,8 +150,7 @@ def predict(payload: PredictPayload):
     return {"predictions": preds}
 
 # -----------------------
-# Optimize (BO): "최적 Voc+Eff 조합" + "다음 실험 A 추천"
-# - A만 들어와도(=모델만 있으면) 항상 best_set 산출 가능
+# Optimize (BO): 캐싱 + 가중치 정규화
 # -----------------------
 @app.post("/optimize")
 def optimize(payload: OptimizePayload):
@@ -175,7 +163,6 @@ def optimize(payload: OptimizePayload):
     Voc_max = max(1e-6, float(state["Voc_max"]))
     Eff_max = max(1e-6, float(state["Eff_max"]))
 
-    # bounds 세팅
     bounds = DEFAULT_BOUNDS.copy()
     if payload.bounds:
         for k, v in payload.bounds.items():
@@ -192,35 +179,68 @@ def optimize(payload: OptimizePayload):
     w_voc = float(payload.w_voc)
     w_eff = float(payload.w_eff)
 
+    # 가중치 정규화 (합=1)
+    w_sum = max(1e-12, w_voc + w_eff)
+    w_voc /= w_sum
+    w_eff /= w_sum
+
     def score_from_pred(voc: float, eff: float) -> float:
-        # 정규화 가중합 (Voc + Eff)
         return (w_voc * (voc / Voc_max)) + (w_eff * (eff / Eff_max))
+
+    # 캐시: (cu, ga, se, thk) -> (voc, eff, neg_score)
+    cache: Dict[Tuple[float, float, float, float], Tuple[float, float, float]] = {}
+    ROUND_N = 6
+
+    def key_from_params(params: Dict[str, float]) -> Tuple[float, float, float, float]:
+        return (
+            round(float(params["cu_ratio"]), ROUND_N),
+            round(float(params["ga_ratio"]), ROUND_N),
+            round(float(params["metal_se"]), ROUND_N),
+            round(float(params["thickness_um"]), ROUND_N),
+        )
+
+    def predict_cached(params: Dict[str, float]) -> Tuple[float, float, float]:
+        k = key_from_params(params)
+        hit = cache.get(k)
+        if hit is not None:
+            return hit
+
+        Xp = pd.DataFrame([{
+            "cu_ratio": k[0],
+            "ga_ratio": k[1],
+            "metal_se": k[2],
+            "thickness_um": k[3],
+        }])[FEATURES]
+
+        voc = float(voc_model.predict(Xp)[0])
+        eff = float(eff_model.predict(Xp)[0])
+        neg = -float(score_from_pred(voc, eff))
+
+        cache[k] = (voc, eff, neg)
+        return voc, eff, neg
 
     @use_named_args(space)
     def objective(**params):
-        X = pd.DataFrame([params])[FEATURES]
-        voc = float(voc_model.predict(X)[0])
-        eff = float(eff_model.predict(X)[0])
-        return -score_from_pred(voc, eff)  # gp_minimize = minimize
+        _, _, neg = predict_cached(params)
+        return neg
 
-    # seed 제공 가능
+    # seed 제공 가능 (seed도 캐시에 반영)
     x0 = None
     y0 = None
     if payload.seed_A:
         x0 = []
         y0 = []
         for s in payload.seed_A:
-            row = [float(s["cu_ratio"]), float(s["ga_ratio"]), float(s["metal_se"]), float(s["thickness_um"])]
-            x0.append(row)
-            Xs = pd.DataFrame([{
-                "cu_ratio": row[0],
-                "ga_ratio": row[1],
-                "metal_se": row[2],
-                "thickness_um": row[3],
-            }])[FEATURES]
-            voc = float(voc_model.predict(Xs)[0])
-            eff = float(eff_model.predict(Xs)[0])
-            y0.append(-score_from_pred(voc, eff))
+            params = {
+                "cu_ratio": float(s["cu_ratio"]),
+                "ga_ratio": float(s["ga_ratio"]),
+                "metal_se": float(s["metal_se"]),
+                "thickness_um": float(s["thickness_um"]),
+            }
+            k = key_from_params(params)
+            x0.append(list(k))
+            voc, eff, neg = predict_cached(params)
+            y0.append(neg)
 
     res = gp_minimize(
         objective,
@@ -233,37 +253,34 @@ def optimize(payload: OptimizePayload):
 
     suggested_A = dict(zip(FEATURES, [float(x) for x in res.x]))
 
-    # suggested_A에서의 예측 Voc/Eff
-    Xs = pd.DataFrame([suggested_A])[FEATURES]
-    voc_s = float(voc_model.predict(Xs)[0])
-    eff_s = float(eff_model.predict(Xs)[0])
-    score_s = float(score_from_pred(voc_s, eff_s))
+    voc_s, eff_s, neg_s = predict_cached(suggested_A)
+    score_s = float(-neg_s)
 
-    # "최적 Voc+Eff 세트" = best_set (여기서는 BO 최적점 자체를 best로 정의)
     best_set = {
         "A": suggested_A,
-        "Voc": voc_s,
-        "Eff": eff_s,
+        "Voc": float(voc_s),
+        "Eff": float(eff_s),
         "score": score_s
     }
 
     return {
-        "suggested_A": suggested_A,                  # 다음 실험 조합
-        "pred_at_suggested": {"Voc": voc_s, "Eff": eff_s, "score": score_s},
-        "best_set": best_set,                        # 네가 말한 "최적 Voc+Eff 세트"
+        "suggested_A": suggested_A,
+        "pred_at_suggested": {"Voc": float(voc_s), "Eff": float(eff_s), "score": score_s},
+        "best_set": best_set,
         "state": state,
         "objective": {
             "type": "weighted_normalized_sum",
             "w_voc": w_voc,
             "w_eff": w_eff,
             "Voc_max": Voc_max,
-            "Eff_max": Eff_max
+            "Eff_max": Eff_max,
+            "cache_size": len(cache),
+            "cache_round": ROUND_N
         }
     }
 
 # -----------------------
 # Explain (LLM): BO 결과를 연구자 친화 텍스트로 변환
-# - n8n에서 /optimize 응답 그대로 POST 하면 됨
 # -----------------------
 @app.post("/explain")
 def explain(payload: ExplainPayload):
@@ -273,7 +290,6 @@ def explain(payload: ExplainPayload):
 
     client = OpenAI(api_key=api_key)
 
-    # payload에서 핵심 뽑기
     suggested_A = payload.suggested_A or {}
     pred = payload.pred_at_suggested or {}
     best = payload.best_set or {}
