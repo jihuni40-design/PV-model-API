@@ -1,3 +1,4 @@
+```python
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any, Tuple
@@ -33,7 +34,7 @@ DEFAULT_BOUNDS = {
 }
 
 # -----------------------
-# Utils: state (정규화 기준)
+# Utils
 # -----------------------
 def load_state() -> Dict[str, float]:
     if os.path.exists(STATE_FILE):
@@ -47,7 +48,10 @@ def save_state(state: Dict[str, float]) -> None:
 
 def ensure_models_exist():
     if not (os.path.exists(VOC_MODEL) and os.path.exists(EFF_MODEL)):
-        raise HTTPException(status_code=400, detail="Model not trained yet. Train first with A+B (Voc, Eff).")
+        raise HTTPException(
+            status_code=400,
+            detail="Model not trained yet. Train first with A+B (Voc, Eff)."
+        )
 
 # -----------------------
 # Schemas
@@ -95,7 +99,7 @@ def health():
     return {"status": "ok"}
 
 # -----------------------
-# Train: Voc & Eff (A+B 입력)
+# Train
 # -----------------------
 @app.post("/train")
 def train(payload: TrainPayload):
@@ -109,8 +113,16 @@ def train(payload: TrainPayload):
     y_voc = df["Voc"]
     y_eff = df["Eff"]
 
-    voc_model = RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42)
-    eff_model = RandomForestRegressor(n_estimators=300, max_depth=12, random_state=42)
+    voc_model = RandomForestRegressor(
+        n_estimators=300,
+        max_depth=12,
+        random_state=42
+    )
+    eff_model = RandomForestRegressor(
+        n_estimators=300,
+        max_depth=12,
+        random_state=42
+    )
 
     voc_model.fit(X, y_voc)
     eff_model.fit(X, y_eff)
@@ -126,7 +138,7 @@ def train(payload: TrainPayload):
     return {"status": "trained", "rows_used": len(df), "state": state}
 
 # -----------------------
-# Predict: Voc & Eff (A 입력)
+# Predict
 # -----------------------
 @app.post("/predict")
 def predict(payload: PredictPayload):
@@ -150,7 +162,7 @@ def predict(payload: PredictPayload):
     return {"predictions": preds}
 
 # -----------------------
-# Optimize (BO): 캐싱 + 가중치 정규화
+# Optimize (BO)
 # -----------------------
 @app.post("/optimize")
 def optimize(payload: OptimizePayload):
@@ -170,16 +182,14 @@ def optimize(payload: OptimizePayload):
                 bounds[k] = (float(v[0]), float(v[1]))
 
     space = [
-        Real(bounds["cu_ratio"][0], bounds["cu_ratio"][1], name="cu_ratio"),
-        Real(bounds["ga_ratio"][0], bounds["ga_ratio"][1], name="ga_ratio"),
-        Real(bounds["metal_se"][0], bounds["metal_se"][1], name="metal_se"),
-        Real(bounds["thickness_um"][0], bounds["thickness_um"][1], name="thickness_um"),
+        Real(*bounds["cu_ratio"], name="cu_ratio"),
+        Real(*bounds["ga_ratio"], name="ga_ratio"),
+        Real(*bounds["metal_se"], name="metal_se"),
+        Real(*bounds["thickness_um"], name="thickness_um"),
     ]
 
     w_voc = float(payload.w_voc)
     w_eff = float(payload.w_eff)
-
-    # 가중치 정규화 (합=1)
     w_sum = max(1e-12, w_voc + w_eff)
     w_voc /= w_sum
     w_eff /= w_sum
@@ -187,23 +197,22 @@ def optimize(payload: OptimizePayload):
     def score_from_pred(voc: float, eff: float) -> float:
         return (w_voc * (voc / Voc_max)) + (w_eff * (eff / Eff_max))
 
-    # 캐시: (cu, ga, se, thk) -> (voc, eff, neg_score)
-    cache: Dict[Tuple[float, float, float, float], Tuple[float, float, float]] = {}
+    cache: Dict[Tuple[float, float, float, float], float] = {}
     ROUND_N = 6
 
-    def key_from_params(params: Dict[str, float]) -> Tuple[float, float, float, float]:
+    def key_from_params(p: Dict[str, float]) -> Tuple[float, float, float, float]:
         return (
-            round(float(params["cu_ratio"]), ROUND_N),
-            round(float(params["ga_ratio"]), ROUND_N),
-            round(float(params["metal_se"]), ROUND_N),
-            round(float(params["thickness_um"]), ROUND_N),
+            round(p["cu_ratio"], ROUND_N),
+            round(p["ga_ratio"], ROUND_N),
+            round(p["metal_se"], ROUND_N),
+            round(p["thickness_um"], ROUND_N),
         )
 
-    def predict_cached(params: Dict[str, float]) -> Tuple[float, float, float]:
+    @use_named_args(space)
+    def objective(**params):
         k = key_from_params(params)
-        hit = cache.get(k)
-        if hit is not None:
-            return hit
+        if k in cache:
+            return cache[k]
 
         Xp = pd.DataFrame([{
             "cu_ratio": k[0],
@@ -214,33 +223,21 @@ def optimize(payload: OptimizePayload):
 
         voc = float(voc_model.predict(Xp)[0])
         eff = float(eff_model.predict(Xp)[0])
-        neg = -float(score_from_pred(voc, eff))
+        neg = -score_from_pred(voc, eff)
 
-        cache[k] = (voc, eff, neg)
-        return voc, eff, neg
-
-    @use_named_args(space)
-    def objective(**params):
-        _, _, neg = predict_cached(params)
+        cache[k] = neg
         return neg
 
-    # seed 제공 가능 (seed도 캐시에 반영)
-    x0 = None
-    y0 = None
+    x0, y0 = None, None
     if payload.seed_A:
-        x0 = []
-        y0 = []
+        x0, y0 = [], []
         for s in payload.seed_A:
-            params = {
-                "cu_ratio": float(s["cu_ratio"]),
-                "ga_ratio": float(s["ga_ratio"]),
-                "metal_se": float(s["metal_se"]),
-                "thickness_um": float(s["thickness_um"]),
-            }
-            k = key_from_params(params)
+            k = key_from_params(s)
             x0.append(list(k))
-            voc, eff, neg = predict_cached(params)
-            y0.append(neg)
+            Xs = pd.DataFrame([dict(zip(FEATURES, k))])[FEATURES]
+            voc = float(voc_model.predict(Xs)[0])
+            eff = float(eff_model.predict(Xs)[0])
+            y0.append(-score_from_pred(voc, eff))
 
     res = gp_minimize(
         objective,
@@ -251,22 +248,22 @@ def optimize(payload: OptimizePayload):
         random_state=42
     )
 
-    suggested_A = dict(zip(FEATURES, [float(x) for x in res.x]))
+    suggested_A = dict(zip(FEATURES, map(float, res.x)))
 
-    voc_s, eff_s, neg_s = predict_cached(suggested_A)
-    score_s = float(-neg_s)
-
-    best_set = {
-        "A": suggested_A,
-        "Voc": float(voc_s),
-        "Eff": float(eff_s),
-        "score": score_s
-    }
+    Xs = pd.DataFrame([suggested_A])[FEATURES]
+    voc_s = float(voc_model.predict(Xs)[0])
+    eff_s = float(eff_model.predict(Xs)[0])
+    score_s = score_from_pred(voc_s, eff_s)
 
     return {
         "suggested_A": suggested_A,
-        "pred_at_suggested": {"Voc": float(voc_s), "Eff": float(eff_s), "score": score_s},
-        "best_set": best_set,
+        "pred_at_suggested": {"Voc": voc_s, "Eff": eff_s, "score": score_s},
+        "best_set": {
+            "A": suggested_A,
+            "Voc": voc_s,
+            "Eff": eff_s,
+            "score": score_s
+        },
         "state": state,
         "objective": {
             "type": "weighted_normalized_sum",
@@ -280,7 +277,7 @@ def optimize(payload: OptimizePayload):
     }
 
 # -----------------------
-# Explain (LLM): BO 결과를 연구자 친화 텍스트로 변환
+# Explain (LLM, GPT-5.2)
 # -----------------------
 @app.post("/explain")
 def explain(payload: ExplainPayload):
@@ -290,44 +287,40 @@ def explain(payload: ExplainPayload):
 
     client = OpenAI(api_key=api_key)
 
-    suggested_A = payload.suggested_A or {}
-    pred = payload.pred_at_suggested or {}
-    best = payload.best_set or {}
-    obj = payload.objective or {}
-
     prompt = f"""
 너는 태양전지(특히 CIGS) 연구실의 선임 연구자다.
-아래는 Bayesian Optimization이 제안한 다음 실험 조합(A)과,
-해당 조합에서 예측된 Voc/Eff(효율)이다.
 
 [BO 제안 A]
-{json.dumps(suggested_A, ensure_ascii=False)}
+{json.dumps(payload.suggested_A, ensure_ascii=False)}
 
-[예측 결과 (해당 A에서)]
-{json.dumps(pred, ensure_ascii=False)}
+[예측 결과]
+{json.dumps(payload.pred_at_suggested, ensure_ascii=False)}
 
-[최적 Voc+Eff 세트(best_set)]
-{json.dumps(best, ensure_ascii=False)}
+[best_set]
+{json.dumps(payload.best_set, ensure_ascii=False)}
 
-[목적 함수 정보]
-{json.dumps(obj, ensure_ascii=False)}
+[objective]
+{json.dumps(payload.objective, ensure_ascii=False)}
 
-요구사항:
-1) 왜 이 A가 Voc와 Eff 관점에서 유망한지 (가정/직관 포함)
-2) 실험에서 주의할 점 (현실적인 조성/공정 리스크)
-3) 다음 실험 실행 체크리스트(간단히)
-4) 결과를 한 문장 요약(연구노트 스타일)
-
-출력은 한국어로, 연구노트 톤으로 작성해.
+연구노트 톤으로:
+1) 왜 이 조합이 Voc/Eff 관점에서 유망한지
+2) 실험 시 주의할 리스크
+3) 다음 실험 체크리스트
+4) 한 문장 요약
 """
 
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You are an expert photovoltaic (CIGS) researcher."},
-            {"role": "user", "content": prompt}
-        ],
+    resp = client.responses.create(
+        model="gpt-5.2",
+        input=prompt,
         temperature=0.4
     )
 
-    return {"llm_explanation": resp.choices[0].message.content}
+    text = ""
+    if resp.output:
+        for item in resp.output:
+            for c in item.get("content", []):
+                if c.get("type") == "output_text":
+                    text += c.get("text", "")
+
+    return {"llm_explanation": text.strip()}
+```
