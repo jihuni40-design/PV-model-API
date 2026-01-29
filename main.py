@@ -118,8 +118,8 @@ def train(payload: TrainPayload):
     y_voc = df["Voc"]
     y_eff = df["Eff"]
 
-    voc_model = RandomForestRegressor(n_estimators=400, max_depth=12, random_state=42)
-    eff_model = RandomForestRegressor(n_estimators=400, max_depth=12, random_state=42)
+    voc_model = RandomForestRegressor(n_estimators=200, max_depth=12, random_state=42)
+    eff_model = RandomForestRegressor(n_estimators=200, max_depth=12, random_state=42)
 
     voc_model.fit(X, y_voc)
     eff_model.fit(X, y_eff)
