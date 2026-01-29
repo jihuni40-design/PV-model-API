@@ -39,9 +39,9 @@ DEFAULT_BOUNDS = {
 UPSTAGE_URL = "https://api.upstage.ai/v1/generation/pro2"
 
 
-# =======================
+# -----------------------
 # Utils
-# =======================
+# -----------------------
 def load_state() -> Dict[str, float]:
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -62,7 +62,7 @@ def ensure_models_exist() -> None:
         )
 
 
-def safe_json(x: Any, max_len: int = 3500) -> str:
+def _safe_json(x: Any, max_len: int = 4000) -> str:
     try:
         s = json.dumps(x if x is not None else {}, ensure_ascii=False)
     except Exception:
@@ -72,9 +72,53 @@ def safe_json(x: Any, max_len: int = 3500) -> str:
     return s
 
 
-# =======================
+def _extract_output_text(resp: Any) -> str:
+    """
+    Robust extractor for OpenAI Responses API:
+    resp.output[*].content[*] where content.type == "output_text"
+    Works for SDK object and dict-like shapes.
+    """
+    # 1) output_text shortcut (if present)
+    t = getattr(resp, "output_text", None)
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+    if isinstance(resp, dict):
+        t = resp.get("output_text")
+        if isinstance(t, str) and t.strip():
+            return t.strip()
+
+    # 2) iterate output blocks
+    output = getattr(resp, "output", None)
+    if output is None and isinstance(resp, dict):
+        output = resp.get("output")
+
+    if not output:
+        return ""
+
+    out_text = ""
+    for item in output:
+        content = getattr(item, "content", None)
+        if content is None and isinstance(item, dict):
+            content = item.get("content", [])
+        if not content:
+            continue
+
+        for c in content:
+            c_type = getattr(c, "type", None)
+            c_text = getattr(c, "text", None)
+            if isinstance(c, dict):
+                c_type = c.get("type", c_type)
+                c_text = c.get("text", c_text)
+
+            if c_type == "output_text" and isinstance(c_text, str):
+                out_text += c_text
+
+    return out_text.strip()
+
+
+# -----------------------
 # Schemas
-# =======================
+# -----------------------
 class TrainRow(BaseModel):
     cu_ratio: float
     ga_ratio: float
@@ -101,6 +145,7 @@ class PredictPayload(BaseModel):
 
 class OptimizePayload(BaseModel):
     n_calls: int = 25
+    top_k: int = 10
     w_voc: float = 0.5
     w_eff: float = 0.5
     bounds: Optional[Dict[str, List[float]]] = None
@@ -111,23 +156,28 @@ class ExplainPayload(BaseModel):
     suggested_A: Optional[Dict[str, float]] = None
     pred_at_suggested: Optional[Dict[str, float]] = None
     best_set: Optional[Dict[str, Any]] = None
+    state: Optional[Dict[str, float]] = None
     objective: Optional[Dict[str, Any]] = None
 
 
-# =======================
+# -----------------------
 # Health
-# =======================
+# -----------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-# =======================
+# -----------------------
 # Train
-# =======================
+# -----------------------
 @app.post("/train")
 def train(payload: TrainPayload):
     df = pd.DataFrame([r.model_dump() for r in payload.rows])
+
+    for col in FEATURES + TARGETS:
+        if col not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Missing column: {col}")
 
     X = df[FEATURES]
     y_voc = df["Voc"]
@@ -143,16 +193,16 @@ def train(payload: TrainPayload):
     joblib.dump(eff_model, EFF_MODEL)
 
     state = load_state()
-    state["Voc_max"] = max(state["Voc_max"], float(df["Voc"].max()))
-    state["Eff_max"] = max(state["Eff_max"], float(df["Eff"].max()))
+    state["Voc_max"] = max(float(state.get("Voc_max", 0.0)), float(df["Voc"].max()))
+    state["Eff_max"] = max(float(state.get("Eff_max", 0.0)), float(df["Eff"].max()))
     save_state(state)
 
     return {"status": "trained", "rows_used": len(df), "state": state}
 
 
-# =======================
+# -----------------------
 # Predict
-# =======================
+# -----------------------
 @app.post("/predict")
 def predict(payload: PredictPayload):
     ensure_models_exist()
@@ -164,21 +214,22 @@ def predict(payload: PredictPayload):
     voc_pred = voc_model.predict(X)
     eff_pred = eff_model.predict(X)
 
-    return {
-        "predictions": [
+    preds = []
+    for i in range(len(X)):
+        preds.append(
             {
                 "A": X.iloc[i].to_dict(),
                 "Voc": float(voc_pred[i]),
                 "Eff": float(eff_pred[i]),
             }
-            for i in range(len(X))
-        ]
-    }
+        )
+
+    return {"predictions": preds}
 
 
-# =======================
+# -----------------------
 # Optimize (BO)
-# =======================
+# -----------------------
 @app.post("/optimize")
 def optimize(payload: OptimizePayload):
     ensure_models_exist()
@@ -187,58 +238,126 @@ def optimize(payload: OptimizePayload):
     eff_model = joblib.load(EFF_MODEL)
 
     state = load_state()
-    Voc_max = max(1e-6, state["Voc_max"])
-    Eff_max = max(1e-6, state["Eff_max"])
+    Voc_max = max(1e-6, float(state.get("Voc_max", 0.75)))
+    Eff_max = max(1e-6, float(state.get("Eff_max", 18.0)))
 
+    # bounds
     bounds = DEFAULT_BOUNDS.copy()
     if payload.bounds:
         for k, v in payload.bounds.items():
-            if k in bounds and len(v) == 2:
+            if k in bounds and isinstance(v, list) and len(v) == 2:
                 bounds[k] = (float(v[0]), float(v[1]))
 
-    space = [Real(*bounds[k], name=k) for k in FEATURES]
+    space = [
+        Real(bounds["cu_ratio"][0], bounds["cu_ratio"][1], name="cu_ratio"),
+        Real(bounds["ga_ratio"][0], bounds["ga_ratio"][1], name="ga_ratio"),
+        Real(bounds["metal_se"][0], bounds["metal_se"][1], name="metal_se"),
+        Real(bounds["thickness_um"][0], bounds["thickness_um"][1], name="thickness_um"),
+    ]
 
-    w_voc, w_eff = payload.w_voc, payload.w_eff
+    # weight normalize
+    w_voc = float(payload.w_voc)
+    w_eff = float(payload.w_eff)
     w_sum = max(1e-12, w_voc + w_eff)
     w_voc /= w_sum
     w_eff /= w_sum
 
-    def score(voc, eff):
-        return (w_voc * voc / Voc_max) + (w_eff * eff / Eff_max)
+    def score_from_pred(voc: float, eff: float) -> float:
+        return (w_voc * (voc / Voc_max)) + (w_eff * (eff / Eff_max))
 
+    # cache neg score by rounded params
     cache: Dict[Tuple[float, float, float, float], float] = {}
+    ROUND_N = 6
+
+    def key_from_params(p: Dict[str, float]) -> Tuple[float, float, float, float]:
+        return (
+            round(float(p["cu_ratio"]), ROUND_N),
+            round(float(p["ga_ratio"]), ROUND_N),
+            round(float(p["metal_se"]), ROUND_N),
+            round(float(p["thickness_um"]), ROUND_N),
+        )
 
     @use_named_args(space)
-    def objective(**p):
-        key = tuple(round(p[k], 6) for k in FEATURES)
-        if key in cache:
-            return cache[key]
+    def objective(**params):
+        k = key_from_params(params)
+        if k in cache:
+            return cache[k]
 
-        Xp = pd.DataFrame([dict(zip(FEATURES, key))])
+        Xp = pd.DataFrame(
+            [
+                {
+                    "cu_ratio": k[0],
+                    "ga_ratio": k[1],
+                    "metal_se": k[2],
+                    "thickness_um": k[3],
+                }
+            ]
+        )[FEATURES]
+
         voc = float(voc_model.predict(Xp)[0])
         eff = float(eff_model.predict(Xp)[0])
-        val = -score(voc, eff)
-        cache[key] = val
-        return val
+        neg = -float(score_from_pred(voc, eff))
 
-    res = gp_minimize(objective, space, n_calls=payload.n_calls, random_state=42)
-    A = dict(zip(FEATURES, map(float, res.x)))
+        cache[k] = neg
+        return neg
 
-    Xs = pd.DataFrame([A])
+    # optional seeds
+    x0, y0 = None, None
+    if payload.seed_A:
+        x0, y0 = [], []
+        for s in payload.seed_A:
+            k = key_from_params(s)
+            x0.append(list(k))
+
+            Xs = pd.DataFrame(
+                [
+                    {
+                        "cu_ratio": k[0],
+                        "ga_ratio": k[1],
+                        "metal_se": k[2],
+                        "thickness_um": k[3],
+                    }
+                ]
+            )[FEATURES]
+
+            voc = float(voc_model.predict(Xs)[0])
+            eff = float(eff_model.predict(Xs)[0])
+            y0.append(-float(score_from_pred(voc, eff)))
+
+    res = gp_minimize(
+        objective,
+        space,
+        n_calls=int(payload.n_calls),
+        x0=x0,
+        y0=y0,
+        random_state=42,
+    )
+
+    suggested_A = dict(zip(FEATURES, map(float, res.x)))
+
+    Xs = pd.DataFrame([suggested_A])[FEATURES]
     voc_s = float(voc_model.predict(Xs)[0])
     eff_s = float(eff_model.predict(Xs)[0])
+    score_s = float(score_from_pred(voc_s, eff_s))
+
+    best_set = {"A": suggested_A, "Voc": voc_s, "Eff": eff_s, "score": score_s}
 
     return {
-        "suggested_A": A,
-        "pred_at_suggested": {"Voc": voc_s, "Eff": eff_s, "score": score(voc_s, eff_s)},
-        "best_set": {"A": A, "Voc": voc_s, "Eff": eff_s},
+        "suggested_A": suggested_A,
+        "pred_at_suggested": {"Voc": voc_s, "Eff": eff_s, "score": score_s},
+        "best_set": best_set,
+        "state": state,
         "objective": {
+            "type": "weighted_normalized_sum",
             "w_voc": w_voc,
             "w_eff": w_eff,
             "Voc_max": Voc_max,
             "Eff_max": Eff_max,
+            "cache_size": len(cache),
+            "cache_round": ROUND_N,
         },
     }
+
 
 # =======================
 # Explain (Upstage Pro2)
@@ -256,18 +375,18 @@ def explain(payload: ExplainPayload):
 너는 태양전지(CIGS) 연구실 선임 연구자다.
 
 [BO 제안 A]
-{safe_json(payload.suggested_A)}
+{_safe_json(payload.suggested_A)}
 
 [예측 결과]
-{safe_json(payload.pred_at_suggested)}
+{_safe_json(payload.pred_at_suggested)}
 
 [best_set]
-{safe_json(payload.best_set)}
+{_safe_json(payload.best_set)}
 
 [objective]
-{safe_json(payload.objective)}
+{_safe_json(payload.objective)}
 
-다음을 태양전지 전문 연구자의 관점에서 연구노트 톤으로 작성:
+다음을 한국어로, 태양전지 전문 연구자의 연구노트 톤으로 작성:
 1) 추출된 효율, Voc 데이터가 왜 최적의 조합인지 설명
 2) 다음 실험에 쓸 최적의 조합 추천
 3) 위 내용 한 문장 요약
@@ -289,7 +408,17 @@ def explain(payload: ExplainPayload):
         )
         r.raise_for_status()
         data = r.json()
-        text = data.get("generated_text") or data.get("output") or ""
+
+        text = ""
+        if "generated_text" in data:
+            text = data["generated_text"]
+        elif "output" in data:
+            text = data["output"]
+        elif "outputs" in data and isinstance(data["outputs"], list):
+            text = data["outputs"][0].get("text", "")
+        elif "result" in data:
+            text = data["result"].get("text", "")
+
     except Exception as e:
         return {
             "llm_explanation": "(Upstage 호출 실패로 설명 생략)",
@@ -299,5 +428,8 @@ def explain(payload: ExplainPayload):
 
     return {
         "llm_explanation": text.strip() or "(Upstage 출력 없음)",
-        "meta": {"provider": "upstage-pro2", "latency_sec": round(time.time() - t0, 3)},
+        "meta": {
+            "provider": "upstage-pro2",
+            "latency_sec": round(time.time() - t0, 3),
+        },
     }
